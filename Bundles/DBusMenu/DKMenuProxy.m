@@ -174,7 +174,7 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (id)_DBusMenu_valueFor_enabled_Property
 {
-  return [NSNumber numberWithBool: [self isEnabled]];
+  return [NSNumber numberWithBool: YES];
 }
 
 - (id)_DBusMenu_valueFor_icon_data_Property
