@@ -457,7 +457,7 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (void)setExported: (BOOL)yesno
 {
-  [self _dispatchAsyncOnMenuQueue:^{
+  [self _dispatchSyncOnMenuQueue:^{
     if ((exported == NO) && (yesno == YES))
       {
         [self notifyMenuServer];
@@ -468,9 +468,9 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (id)initWithMenu:(NSMenu *)menu
 {
-  if (menu == nil || [menu numberOfItems] == 0)
+  if (menu == nil)
   {
-    NSLog(@"[DKMenuProxy] Skipping initWithMenu: due to empty or nil menu");
+    NSLog(@"[DKMenuProxy] Cannot initialize with nil menu");
     return nil;
   }
 
@@ -486,19 +486,17 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
     dBusToNative = NSCreateMapTable(NSIntegerMapKeyCallBacks,
                                     NSNonRetainedObjectMapValueCallBacks, 24);
     
-    // Initialize mapping on queue
-    [self _dispatchAsyncOnMenuQueue:^{
-      [self _createMapping];
-    }];
+    // Create mapping synchronously during init - CRITICAL for D-Bus export
+    [self _createMapping];
   }
   return self;
 }
 
 - (void)menuUpdated:(NSMenu *)menu
 {
-  if (menu == nil || [menu numberOfItems] == 0)
+  if (menu == nil)
   {
-    NSLog(@"[DKMenuProxy] Skipping menuUpdated: due to empty or nil menu");
+    NSLog(@"[DKMenuProxy] Cannot update with nil menu");
     return;
   }
 
@@ -522,10 +520,8 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
     // Atomic increment is safe
     __sync_fetch_and_add(&revision, 1);
     
-    // Notify on background queue to avoid blocking
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-      [self notifyMenuServer];
-    });
+    // Notify immediately after mapping update, like original code
+    [self notifyMenuServer];
     
     NSDebugMLLog(@"DKMenu", @"Represented menu updated");
   }];
