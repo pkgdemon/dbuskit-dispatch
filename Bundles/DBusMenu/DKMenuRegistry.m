@@ -32,6 +32,8 @@
 #import <DBusKit/DBusKit.h>
 #import "com_canonical_AppMenu_Registrar.h"
 #import "DKMenuProxy.h"
+#import <dispatch/dispatch.h>
+
 @interface NSObject (PrivateStuffDoNotUse)
 - (id) _objectPathNodeAtPath: (NSString*)string;
 - (void)_setObject: (id)obj atPath: (NSString*)path; 
@@ -41,6 +43,12 @@
 - (BOOL)_loadIntrospectionFromFile: (NSString*)path;
 @end
 
+@interface DKMenuRegistry ()
+{
+  dispatch_queue_t registryQueue;
+  dispatch_group_t setupGroup;
+}
+@end
 
 @implementation DKMenuRegistry
 
@@ -53,6 +61,11 @@
   {
     return nil;
   }
+  
+  // Create dedicated queue for registry operations
+  registryQueue = dispatch_queue_create("org.gnustep.dbuskit.registry", DISPATCH_QUEUE_SERIAL);
+  setupGroup = dispatch_group_create();
+  
   registrar = [(id)[connection proxyAtPath: @"/com/canonical/AppMenu/Registrar"] retain];
 
   if (nil == registrar)
@@ -72,6 +85,12 @@
   [windowNumbers release];
   [busProxy release];
   [menuProxy release];
+  if (registryQueue) {
+    dispatch_release(registryQueue);
+  }
+  if (setupGroup) {
+    dispatch_release(setupGroup);
+  }
   [super dealloc];
 }
 
@@ -87,84 +106,112 @@
   return [self new];
 }
 
-- (void)_safeRegisterWindow:(NSDictionary *)args
+- (void)_registerWindowSafely:(NSWindow *)window
 {
-  if (busProxy == nil)
-  {
-    NSLog(@"[DKMenuRegistry] Skipping RegisterWindow — no busProxy available.");
-    return;
-  }
+  dispatch_async(registryQueue, ^{
+    if (busProxy == nil)
+    {
+      NSLog(@"[DKMenuRegistry] Skipping RegisterWindow — no busProxy available.");
+      return;
+    }
 
-  NSWindow *window = [args objectForKey:@"window"];
-  int internalNumber = [window windowNumber];
-  GSDisplayServer *srv = GSServerForWindow(window);
-  uint32_t number = (uint32_t)(uintptr_t)[srv windowDevice: internalNumber];
-  NSNumber *boxed = [NSNumber numberWithInt: number];
+    int internalNumber = [window windowNumber];
+    GSDisplayServer *srv = GSServerForWindow(window);
+    uint32_t number = (uint32_t)(uintptr_t)[srv windowDevice: internalNumber];
+    NSNumber *boxed = [NSNumber numberWithInt: number];
 
-  if ((NO == [windowNumbers containsIndex: number]))
-  {
-    NSDebugMLLog(@"DKMenu", @"(Deferred) Publishing menu for window %d", number);
-    [registrar RegisterWindow: boxed : busProxy];
-    [windowNumbers addIndex: number];
-  }
+    if ((NO == [windowNumbers containsIndex: number]))
+    {
+      NSDebugMLLog(@"DKMenu", @"Publishing menu for window %d", number);
+      [registrar RegisterWindow: boxed : busProxy];
+      [windowNumbers addIndex: number];
+    }
+  });
 }
 
 - (void)setupProxyForMenu: (NSMenu*)menu
 {
-  if (menuProxy != nil)
-  {
-    NSLog(@"[DKMenuRegistry] Proxy already exists, skipping export.");
-    return;
-  }
+  dispatch_group_async(setupGroup, registryQueue, ^{
+    if (menuProxy != nil)
+    {
+      NSLog(@"[DKMenuRegistry] Proxy already exists, skipping export.");
+      return;
+    }
 
-  if (menu == nil || [menu numberOfItems] == 0)
-  {
-    NSLog(@"[DKMenuRegistry] Not exporting proxy for empty menu.");
-    return;
-  }
+    if (menu == nil || [menu numberOfItems] == 0)
+    {
+      NSLog(@"[DKMenuRegistry] Not exporting proxy for empty menu.");
+      return;
+    }
 
-  menuProxy = [[DKMenuProxy alloc] initWithMenu: menu];
-  DKPort *p = (DKPort*)[DKPort port];
+    menuProxy = [[DKMenuProxy alloc] initWithMenu: menu];
+    if (menuProxy == nil)
+    {
+      NSLog(@"[DKMenuRegistry] Failed to create menu proxy.");
+      return;
+    }
 
-  @try
-  {
-    [p _setObject: menuProxy atPath: @"/org/gnustep/application/mainMenu"];
-  }
-  @catch (NSException *e)
-  {
-    NSLog(@"[DKMenuRegistry] Failed to export menu proxy: %@", e.reason);
-    menuProxy = nil;
-    return;
-  }
+    DKPort *p = (DKPort*)[DKPort port];
 
-  busProxy = [p _objectPathNodeAtPath: @"/org/gnustep/application/mainMenu"];
-  [menuProxy setExported: YES];
+    @try
+    {
+      [p _setObject: menuProxy atPath: @"/org/gnustep/application/mainMenu"];
+    }
+    @catch (NSException *e)
+    {
+      NSLog(@"[DKMenuRegistry] Failed to export menu proxy: %@", e.reason);
+      [menuProxy release];
+      menuProxy = nil;
+      return;
+    }
 
-  NSBundle *bundle = [NSBundle bundleForClass: [self class]];
-  NSString *path = [bundle pathForResource: @"com.canonical.dbusmenu" ofType: @"xml"];
-  [busProxy _loadIntrospectionFromFile: path];
+    busProxy = [[p _objectPathNodeAtPath: @"/org/gnustep/application/mainMenu"] retain];
+    if (busProxy == nil)
+    {
+      NSLog(@"[DKMenuRegistry] Failed to get bus proxy.");
+      [menuProxy release];
+      menuProxy = nil;
+      return;
+    }
+
+    NSBundle *bundle = [NSBundle bundleForClass: [self class]];
+    NSString *path = [bundle pathForResource: @"com.canonical.dbusmenu" ofType: @"xml"];
+    if (path != nil)
+    {
+      [busProxy _loadIntrospectionFromFile: path];
+    }
+
+    [menuProxy setExported: YES];
+    NSDebugMLLog(@"DKMenu", @"Menu proxy setup completed successfully.");
+  });
 }
 
 - (void)setMenu:(NSMenu *)menu forWindow:(NSWindow *)window
 {
+  // Setup proxy asynchronously if needed
   if (menuProxy == nil)
   {
     [self setupProxyForMenu: menu];
-
-    if (menuProxy == nil)
-    {
-      NSLog(@"[DKMenuRegistry] Menu proxy was not created — aborting setMenu");
-      return;
-    }
+  }
+  else
+  {
+    // Update existing proxy with new menu
+    dispatch_async(registryQueue, ^{
+      [menuProxy menuUpdated: menu];
+    });
   }
 
-  NSDictionary *args = [NSDictionary dictionaryWithObject: window forKey: @"window"];
-
-  [[NSRunLoop currentRunLoop] performSelector:@selector(_safeRegisterWindow:)
-                                       target:self
-                                     argument:args
-                                        order:0
-                                        modes:[NSArray arrayWithObject: NSDefaultRunLoopMode]];
+  // Wait for setup to complete, then register window
+  dispatch_group_notify(setupGroup, dispatch_get_main_queue(), ^{
+    if (menuProxy != nil)
+    {
+      [self _registerWindowSafely: window];
+    }
+    else
+    {
+      NSLog(@"[DKMenuRegistry] Menu proxy was not created — aborting setMenu");
+    }
+  });
 }
 
 @end

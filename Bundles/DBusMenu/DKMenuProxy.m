@@ -27,7 +27,6 @@
 #import <Foundation/NSDictionary.h>
 #import <Foundation/NSException.h>
 #import <Foundation/NSInvocation.h>
-#import <Foundation/NSLock.h>
 #import <Foundation/NSMapTable.h>
 #import <Foundation/NSString.h>
 #import <Foundation/NSValue.h>
@@ -45,8 +44,12 @@
 #import <DBusKit/DKVariant.h>
 #import <DBusKit/DKNotificationCenter.h>
 
+// Import libdispatch
+#import <dispatch/dispatch.h>
+
 #define VARIANT(X) [DKVariant variantWithObject: X]
 #define DK_INT32(X) [DKInt32Number numberWithInt32: X]
+
 /*
  * The keys for menu properties. We export these in the header.
  */
@@ -174,7 +177,7 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (id)_DBusMenu_valueFor_enabled_Property
 {
-  return [NSNumber numberWithBool: YES];
+  return [NSNumber numberWithBool: [self isEnabled]];
 }
 
 - (id)_DBusMenu_valueFor_icon_data_Property
@@ -342,6 +345,26 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
   }
 }
 
+- (void)_dispatchSyncOnMenuQueue:(void (^)(void))block
+{
+  if (dispatch_get_specific([self menuQueueKey]) != NULL) {
+    // Already on menu queue, execute directly to avoid deadlock
+    block();
+  } else {
+    dispatch_sync(menuQueue, block);
+  }
+}
+
+- (void)_dispatchAsyncOnMenuQueue:(void (^)(void))block
+{
+  dispatch_async(menuQueue, block);
+}
+
+- (const void *)menuQueueKey
+{
+  static const void *key = &key;
+  return key;
+}
 
 - (void)_mapMenu: (NSMenu*)menu usingIdentifierReference: (int32_t*)identifier
 {
@@ -364,6 +387,7 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (void)_createMapping
 {
+  // This method must be called from menuQueue
   NSResetMapTable(nativeToDBus);
   NSResetMapTable(dBusToNative);
   int32_t identifier = 1; // 0 would be the root
@@ -384,29 +408,35 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (BOOL)isExported
 {
-  return exported;
+  __block BOOL result;
+  [self _dispatchSyncOnMenuQueue:^{
+    result = exported;
+  }];
+  return result;
 }
 
 - (int32_t)DBusIDForMenuObject: (NSMenuItem*)item
 {
-  int32_t identifier = 0;
-  [lock lock];
-  identifier = (int32_t)(intptr_t)NSMapGet(nativeToDBus, (void*)item);
-  [lock unlock];
+  __block int32_t identifier = 0;
+  [self _dispatchSyncOnMenuQueue:^{
+    identifier = (int32_t)(intptr_t)NSMapGet(nativeToDBus, (void*)item);
+  }];
   return identifier;
 }
 
 - (NSMenuItem*)_nativeMenuObjectForDBusID: (int32_t)identifier
 {
-  NSMenuItem* item = nil;
-  [lock lock];
-  item = (id)NSMapGet(dBusToNative, (void*)(intptr_t)identifier);
-  [lock unlock];
+  __block NSMenuItem* item = nil;
+  [self _dispatchSyncOnMenuQueue:^{
+    item = (id)NSMapGet(dBusToNative, (void*)(intptr_t)identifier);
+  }];
   return item;
 }
+
 - (void)notifyMenuServer
 {
- if (NO == exported)
+  // Check if exported without locking since it's atomic
+  if (NO == exported)
    {
      return;
    }
@@ -427,14 +457,14 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (void)setExported: (BOOL)yesno
 {
-  if ((exported == NO) && (yesno == YES))
-    {
-      [self notifyMenuServer];
-    }
-  exported = yesno;
+  [self _dispatchAsyncOnMenuQueue:^{
+    if ((exported == NO) && (yesno == YES))
+      {
+        [self notifyMenuServer];
+      }
+    exported = yesno;
+  }];
 }
-
-
 
 - (id)initWithMenu:(NSMenu *)menu
 {
@@ -446,16 +476,24 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
   if ((self = [super init]) != nil)
   {
+    // Create dispatch queue with specific key for deadlock detection
+    menuQueue = dispatch_queue_create("org.gnustep.dbuskit.menu", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_set_specific(menuQueue, [self menuQueueKey], (void *)1, NULL);
+    
     representedMenu = [menu retain];
     nativeToDBus = NSCreateMapTable(NSNonRetainedObjectMapKeyCallBacks,
                                     NSIntegerMapValueCallBacks, 24);
     dBusToNative = NSCreateMapTable(NSIntegerMapKeyCallBacks,
                                     NSNonRetainedObjectMapValueCallBacks, 24);
-    lock = [NSRecursiveLock new];
-    [self _createMapping];
+    
+    // Initialize mapping on queue
+    [self _dispatchAsyncOnMenuQueue:^{
+      [self _createMapping];
+    }];
   }
   return self;
 }
+
 - (void)menuUpdated:(NSMenu *)menu
 {
   if (menu == nil || [menu numberOfItems] == 0)
@@ -464,27 +502,33 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
     return;
   }
 
-  [lock lock];
-  if (![menu isEqual:representedMenu])
-  {
-    ASSIGN(representedMenu, menu);
-  }
-
-  NS_DURING
+  [self _dispatchAsyncOnMenuQueue:^{
+    if (![menu isEqual:representedMenu])
     {
-      [self _createMapping];
+      ASSIGN(representedMenu, menu);
     }
-  NS_HANDLER
-    {
-      [lock unlock];
-      [localException raise];
-    }
-  NS_ENDHANDLER
 
-  __sync_fetch_and_add(&revision, 1);
-  [self notifyMenuServer];
-  NSDebugMLLog(@"DKMenu", @"Represented menu updated");
-  [lock unlock];
+    NS_DURING
+      {
+        [self _createMapping];
+      }
+    NS_HANDLER
+      {
+        NSLog(@"[DKMenuProxy] Exception during menu update: %@", localException);
+        return;
+      }
+    NS_ENDHANDLER
+
+    // Atomic increment is safe
+    __sync_fetch_and_add(&revision, 1);
+    
+    // Notify on background queue to avoid blocking
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+      [self notifyMenuServer];
+    });
+    
+    NSDebugMLLog(@"DKMenu", @"Represented menu updated");
+  }];
 }
 
 - (uint32_t)Version
@@ -500,89 +544,96 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 
 - (NSArray*)layoutForParent: (int32_t)parentID depth: (int32_t)depth properties: (NSArray*)propertyNames
 { 
-  NSArray *layout = nil;
-  [lock lock];
-  // TODO: Exception handler
-  if (parentID == 0)
-    {
-      NSNumber *identifier = DK_INT32(0);
-      NSDictionary *properties = DKMenuPropertyDictionaryForDBusProperties(representedMenu, propertyNames);
-      NSArray *children = nil;
-      if (0 == depth)
-        {
-          children = [NSArray array];
-        }
-      else
-        {
-          NSMutableArray *c = [NSMutableArray array];
-          NSInteger nextDepth = depth;
-          if (depth != -1)
-            {
-              nextDepth = depth - 1;
-            }
-          NSArray *items = [representedMenu itemArray];
-          NSEnumerator *iEnum = [items objectEnumerator];
-          NSMenuItem *item = nil;
-          while (nil != (item = [iEnum nextObject]))
-            {
-              NSArray *childLayout = [item layoutToDepth: nextDepth
-                                              properties: propertyNames
-                                                forProxy: self];   
-              if (nil != childLayout)
-                {
-                  [c addObject: childLayout];
-                }
-            }
-          children = c;
-        }
-      layout = [DKStructArray arrayWithObjects: identifier, properties, children, nil];
-    }
-  else
-    {
-       // General case
-       id menuObject = [self _nativeMenuObjectForDBusID: parentID];
-       layout =  [menuObject layoutToDepth: depth
-                                properties: propertyNames
-                                  forProxy: self];
-    }
-  [lock unlock];
+  __block NSArray *layout = nil;
+  [self _dispatchSyncOnMenuQueue:^{
+    // TODO: Exception handler
+    if (parentID == 0)
+      {
+        NSNumber *identifier = DK_INT32(0);
+        NSDictionary *properties = DKMenuPropertyDictionaryForDBusProperties(representedMenu, propertyNames);
+        NSArray *children = nil;
+        if (0 == depth)
+          {
+            children = [NSArray array];
+          }
+        else
+          {
+            NSMutableArray *c = [NSMutableArray array];
+            NSInteger nextDepth = depth;
+            if (depth != -1)
+              {
+                nextDepth = depth - 1;
+              }
+            NSArray *items = [representedMenu itemArray];
+            NSEnumerator *iEnum = [items objectEnumerator];
+            NSMenuItem *item = nil;
+            while (nil != (item = [iEnum nextObject]))
+              {
+                NSArray *childLayout = [item layoutToDepth: nextDepth
+                                                properties: propertyNames
+                                                  forProxy: self];   
+                if (nil != childLayout)
+                  {
+                    [c addObject: childLayout];
+                  }
+              }
+            children = c;
+          }
+        layout = [DKStructArray arrayWithObjects: identifier, properties, children, nil];
+      }
+    else
+      {
+         // General case
+         id menuObject = [self _nativeMenuObjectForDBusID: parentID];
+         layout =  [menuObject layoutToDepth: depth
+                                  properties: propertyNames
+                                    forProxy: self];
+      }
+  }];
   NSDebugMLLog(@"DKMenu", @"Created layout: %@", layout);
   return [NSArray arrayWithObjects: [NSNumber numberWithUnsignedInt: revision], layout, nil];
 }
 
 - (NSArray*)menuItems: (NSArray*)menuItemIDs properties: (NSArray*)propertyNames
 {
-  NSEnumerator *mEnum = [menuItemIDs objectEnumerator];
-  NSNumber *item = nil;
-  NSMutableArray *array = [NSMutableArray arrayWithCapacity: [menuItemIDs count]]; 
-  while (nil != (item = [mEnum nextObject]))
-  {
-    id menuObject = nil;
-    if (0 == [item unsignedIntegerValue])
-      {
-        menuObject = representedMenu;
-      }
-    else
-      {
-        menuObject = [self _nativeMenuObjectForDBusID: [item unsignedIntegerValue]]; 
-      }
-    if (nil == menuObject)
+  __block NSMutableArray *array = [NSMutableArray arrayWithCapacity: [menuItemIDs count]];
+  
+  [self _dispatchSyncOnMenuQueue:^{
+    NSEnumerator *mEnum = [menuItemIDs objectEnumerator];
+    NSNumber *item = nil;
+    while (nil != (item = [mEnum nextObject]))
     {
-      continue;
+      id menuObject = nil;
+      if (0 == [item unsignedIntegerValue])
+        {
+          menuObject = representedMenu;
+        }
+      else
+        {
+          menuObject = [self _nativeMenuObjectForDBusID: [item unsignedIntegerValue]]; 
+        }
+      if (nil == menuObject)
+      {
+        continue;
+      }
+      NSDictionary *propertyDict =  DKMenuPropertyDictionaryForDBusProperties(menuObject,propertyNames);
+      [array addObject: [DKStructArray arrayWithObjects: item, propertyDict, nil]]; 
     }
-    NSDictionary *propertyDict =  DKMenuPropertyDictionaryForDBusProperties(menuObject,propertyNames);
-    [array addObject: [DKStructArray arrayWithObjects: item, propertyDict, nil]]; 
-  }
+  }];
+  
   NSDebugMLLog(@"DKMenu", @"Responding to property query %@ for %@: %@", propertyNames, menuItemIDs, array);
   return array;
 }
 
 - (id)menuItem: (NSNumber*)menuID property: (NSString*)property
 {
-  id menuObject = [self _nativeMenuObjectForDBusID: [menuID unsignedIntegerValue]];
-  return [menuObject valueForDBusProperty: property];
+  __block id result = nil;
+  [self _dispatchSyncOnMenuQueue:^{
+    id menuObject = [self _nativeMenuObjectForDBusID: [menuID unsignedIntegerValue]];
+    result = [menuObject valueForDBusProperty: property];
+  }];
+  return result;
 }
-
 
 - (void)menuItem: (NSNumber*)menuID
    receivedEvent: (NSString*)eventType
@@ -591,14 +642,17 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
 {
   if ([DKMenuEventClicked isEqualToString: eventType])
     {
-      NSMenuItem *item = [self _nativeMenuObjectForDBusID: [menuID unsignedIntegerValue]];
-      SEL action = [item action];
-      id target = [item target];
-      NSDebugMLLog(@"DKMenu", @"Sending action %@ to %@ from %@ (D-Bus ID: %@)",
-        NSStringFromSelector(action), target, item, menuID);
-      [NSApp sendAction: action
-                     to: target
-                   from: item];
+      // Handle menu clicks on main queue for UI safety
+      dispatch_async(dispatch_get_main_queue(), ^{
+        NSMenuItem *item = [self _nativeMenuObjectForDBusID: [menuID unsignedIntegerValue]];
+        SEL action = [item action];
+        id target = [item target];
+        NSDebugMLLog(@"DKMenu", @"Sending action %@ to %@ from %@ (D-Bus ID: %@)",
+          NSStringFromSelector(action), target, item, menuID);
+        [NSApp sendAction: action
+                       to: target
+                     from: item];
+      });
     }
   else
     {
@@ -618,7 +672,9 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
   NSFreeMapTable(nativeToDBus);
   NSFreeMapTable(dBusToNative);
   [center release];
-  [lock release];
+  if (menuQueue) {
+    dispatch_release(menuQueue);
+  }
   [super dealloc];
 }
 @end

@@ -25,8 +25,9 @@
 #import <Foundation/NSObject.h>
 #import <AppKit/NSMenu.h>
 #import "DKDBusMenu.h"
+#import <dispatch/dispatch.h>
 
-@class DKNotificationCenter, NSRecursiveLock, NSMapTable;
+@class DKNotificationCenter, NSMapTable;
 
 @interface DKMenuProxy : NSObject <DKDBusMenu>
 {
@@ -34,7 +35,7 @@
   NSUInteger revision;
   NSMapTable *nativeToDBus;
   NSMapTable *dBusToNative;
-  NSRecursiveLock *lock;
+  dispatch_queue_t menuQueue;
   DKNotificationCenter *center;
   BOOL exported;
 }
@@ -43,4 +44,9 @@
 - (int32_t)DBusIDForMenuObject: (NSMenuItem*)item;
 - (BOOL)isExported;
 - (void)setExported: (BOOL)yesno;
+
+// Private methods for queue management
+- (void)_dispatchSyncOnMenuQueue:(void (^)(void))block;
+- (void)_dispatchAsyncOnMenuQueue:(void (^)(void))block;
+- (const void *)menuQueueKey;
 @end
