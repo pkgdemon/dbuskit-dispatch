@@ -46,6 +46,7 @@
 @interface DKMenuRegistry ()
 {
   dispatch_queue_t registryQueue;
+  BOOL proxyCreationInProgress;
 }
 @end
 
@@ -66,6 +67,7 @@
   
   // Create dedicated queue for registry operations
   registryQueue = dispatch_queue_create("org.gnustep.dbuskit.registry", DISPATCH_QUEUE_SERIAL);
+  proxyCreationInProgress = NO;
   
   registrar = [(id)[connection proxyAtPath: @"/com/canonical/AppMenu/Registrar"] retain];
 
@@ -130,8 +132,8 @@
   {
     NSLog(@"[DKMenuRegistry] Publishing menu for window %d", number);
     
-    // Make the actual D-Bus call on main thread like original code
-    dispatch_sync(dispatch_get_main_queue(), ^{
+    // Make the actual D-Bus call on main thread but async to prevent deadlock
+    dispatch_async(dispatch_get_main_queue(), ^{
       @try {
         [registrar RegisterWindow: boxed : busProxy];
         NSLog(@"[DKMenuRegistry] Successfully registered window %d", number);
@@ -252,7 +254,7 @@
 - (void)_createProxyForMenu: (NSMenu*)menu
 {
   // This method must be called from registryQueue
-  NSLog(@"[DKMenuRegistry] _createProxyForMenu called with menu: %@", menu);
+  NSLog(@"[DKMenuRegistry] _createProxyForMenu called with menu: %@ (items: %lu)", [menu title], [menu numberOfItems]);
   
   menuProxy = [[DKMenuProxy alloc] initWithMenu: menu];
   if (menuProxy == nil)

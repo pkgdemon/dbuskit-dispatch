@@ -391,8 +391,13 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
   NSResetMapTable(nativeToDBus);
   NSResetMapTable(dBusToNative);
   int32_t identifier = 1; // 0 would be the root
+  
+  NSLog(@"[DKMenuProxy] Creating mapping for menu: %@ with %lu items", 
+        [representedMenu title], [representedMenu numberOfItems]);
+  
   [self _mapMenu: representedMenu usingIdentifierReference: &identifier]; 
-            
+  
+  NSLog(@"[DKMenuProxy] Created mappings for %d menu items", (identifier - 1));
   NSDebugMLLog(@"DKMenu", @"Created mappings for %d menu items", (identifier - 1));
 }
 
@@ -438,6 +443,7 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
   // Check if exported without locking since it's atomic
   if (NO == exported)
    {
+     NSLog(@"[DKMenuProxy] Skipping notification - proxy not exported yet");
      return;
    }
  // We could do this much more efficiently if we had a smarter
@@ -449,20 +455,28 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
    {
      center = [[DKNotificationCenter sessionBusCenter] retain];
    }
+ 
+ NSLog(@"[DKMenuProxy] Sending LayoutUpdated notification with revision %lu", revision);
  [center postSignalName: @"LayoutUpdated"
               interface: @"com.canonical.dbusmenu"
                  object: self
                userInfo: info];
+ NSLog(@"[DKMenuProxy] LayoutUpdated notification sent");
 }
 
 - (void)setExported: (BOOL)yesno
 {
+  NSLog(@"[DKMenuProxy] setExported called with %@", yesno ? @"YES" : @"NO");
   [self _dispatchSyncOnMenuQueue:^{
-    if ((exported == NO) && (yesno == YES))
+    BOOL wasExported = exported;
+    exported = yesno;  // Set exported flag FIRST
+    NSLog(@"[DKMenuProxy] Proxy exported state set to %@", exported ? @"YES" : @"NO");
+    
+    if ((wasExported == NO) && (yesno == YES))
       {
+        NSLog(@"[DKMenuProxy] Proxy being exported for first time, sending initial notification");
         [self notifyMenuServer];
       }
-    exported = yesno;
   }];
 }
 
@@ -500,15 +514,23 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
     return;
   }
 
+  NSLog(@"[DKMenuProxy] menuUpdated called with menu: %@ (items: %lu)", [menu title], [menu numberOfItems]);
+
   [self _dispatchAsyncOnMenuQueue:^{
     if (![menu isEqual:representedMenu])
     {
+      NSLog(@"[DKMenuProxy] Menu changed, updating representedMenu");
       ASSIGN(representedMenu, menu);
+    }
+    else
+    {
+      NSLog(@"[DKMenuProxy] Same menu object, but may have updated items");
     }
 
     NS_DURING
       {
         [self _createMapping];
+        NSLog(@"[DKMenuProxy] Menu mapping recreated");
       }
     NS_HANDLER
       {
@@ -518,7 +540,9 @@ NSDictionary* DKMenuPropertyDictionaryForDBusProperties(id menuObject, NSArray* 
     NS_ENDHANDLER
 
     // Atomic increment is safe
+    NSUInteger oldRevision = revision;
     __sync_fetch_and_add(&revision, 1);
+    NSLog(@"[DKMenuProxy] Menu revision updated from %lu to %lu", oldRevision, revision);
     
     // Notify immediately after mapping update, like original code
     [self notifyMenuServer];
